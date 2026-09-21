@@ -1,0 +1,119 @@
+name: Run Discord Bot
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # 5分ごとにチェックしてボットが落ちていたら再起動
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # 手動で起動できるボタンを追加
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # リポジトリへの書き込み権限を付与
+    
+    # 同じコミットに対して同時に複数のワークフローが実行されないようにする
+    concurrency: 
+      group: bot-${{ github.ref }}
+      cancel-in-progress: true
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Set timezone to Japan
+      run: |
+        sudo timedatectl set-timezone Asia/Tokyo
+        date
+
+    # Python環境をセットアップ
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    # ボットに必要な部品のインストール + jqをインストール
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        sudo apt-get update && sudo apt-get install -y jq
+
+    # dataディレクトリを作成して既存のデータを保護
+    - name: Setup data directory
+      run: |
+        mkdir -p logs temp data
+        chmod 755 logs temp data
+
+    - name: Configure Git for Actions
+      run: |
+        git config --local user.email "actions-user@github.com"
+        git config --local user.name "actions-user"
+
+    - name: Preserve existing data
+      run: |
+        # 既存のデータファイルをdataディレクトリに移行（初回のみ）
+        if [ -f "./user_manuals.json" ] && [ ! -f "data/user_manuals.json" ]; then
+          echo "📊 user_manuals.jsonをdata/user_manuals.jsonに移行します"
+          cp ./user_manuals.json data/user_manuals.json
+        fi
+        
+        # 既存のデータファイルをルートにコピー
+        if [ -f "data/user_manuals.json" ]; then
+          echo "📊 既存のuser_manuals.jsonをルートにコピーします"
+          cp data/user_manuals.json ./user_manuals.json
+          echo "✅ データの準備が完了しました"
+        else
+          echo "⚠️ 既存のuser_manuals.jsonが見つからないため、新規に作成されます"
+        fi
+
+    - name: Start Bot
+      env:
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      run: |
+        # データファイルの存在を確認
+        if [ ! -f "./user_manuals.json" ]; then
+          echo "⚠️ user_manuals.jsonが存在しないため、新規作成します"
+          echo "{}" > user_manuals.json
+          chmod 644 user_manuals.json
+        fi
+        
+        # ボットを起動（ログはGitHub ActionsのStart Botステップに直接出力）
+        mkdir -p temp
+        python main.py &
+        echo $! > temp/bot.pid
+        
+        # プロセスが実行中か確認
+        if ! ps -p $(cat temp/bot.pid) > /dev/null; then
+          echo "ボットの起動に失敗しました"
+          exit 1
+        fi
+        
+        echo "ボットが正常に起動しました"
+        
+        # ボットの実行中、定期的にデータをコミットし続ける
+        while true; do
+          # ボットがまだ実行中か確認
+          if ! ps -p $(cat temp/bot.pid) > /dev/null; then
+            echo "ボットが終了しました。再起動します..."
+            # 再起動前に最新のデータをコピー
+            cp ./user_manuals.json data/user_manuals.json
+            # 再起動（ログはGitHub ActionsのStart Botステップに直接出力）
+            python main.py &
+            echo $! > temp/bot.pid
+            sleep 10
+          fi
+          
+          # 5分ごとにデータをコミット
+          sleep 300
+          # 実行中に更新されたuser_manuals.jsonをdataディレクトリに同期
+          cp ./user_manuals.json data/user_manuals.json
+          git status
+          git add data/user_manuals.json
+          git commit -m "Auto-update user_manuals.json [skip ci]" || echo "No changes to commit"
+          git push
+        done
